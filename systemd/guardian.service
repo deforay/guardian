@@ -1,0 +1,9 @@
+[Unit]
+Description=guardian — keep core services healthy (one pass)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/guardian run
+# Runs as root: it needs to restart services. No User= on purpose.

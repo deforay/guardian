@@ -1,0 +1,10 @@
+[Unit]
+Description=Run guardian on demand when an app drops a request file
+
+[Path]
+# An app summons guardian by creating /run/guardian/req/<something>.
+PathExistsGlob=/run/guardian/req/*
+Unit=guardian.service
+
+[Install]
+WantedBy=paths.target

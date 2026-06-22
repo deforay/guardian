@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+#
+# guardian — a small self-healing service for single-box LAMP-style servers.
+#
+# Runs as root from a systemd timer (~every 60s). It keeps core services up
+# (Apache, MySQL/MariaDB, PHP-FPM if present) and watches disk/memory. If an app
+# registers a "guardian stack" of hook scripts, guardian also calls those for
+# app-specific recovery — but it works fine with no apps registered at all.
+#
+# Pure bash + systemd, zero app dependencies, so it keeps working when an app is
+# broken (dead DB, full disk). App hooks are optional, time-boxed and isolated:
+# a broken hook never affects the box or other apps.
+#
+# Turn it off when YOU stop a service on purpose:
+#   guardian off            # everything off
+#   guardian off mysql      # leave MySQL alone (e.g. maintenance)
+#   guardian off apache2 2h # ...for 2 hours, then auto-resume
+#   guardian on  mysql      # guard it again
+#
+# Commands:
+#   guardian run            one healing pass (what the timer calls)
+#   guardian status         show what's guarded / off
+#   guardian off [svc] [dur]   disable guardian, or just one service (dur: 30m,2h,90s)
+#   guardian on  [svc]         re-enable
+#
+# https://github.com/deforay/guardian
+
+# No `set -e`: a healing pass must not abort just because one probe returns
+# non-zero. We handle errors explicitly and keep going.
+set -uo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---- defaults (override in /etc/guardian/guardian.conf) -------------------
+ETC_DIR=/etc/guardian
+CONF_FILE="${ETC_DIR}/guardian.conf"
+APPS_DIR="${ETC_DIR}/apps.d"
+STATE_DIR=/var/lib/guardian
+REQ_DIR=/run/guardian/req
+
+DISK_WARN=85
+DISK_CRIT=95
+MEM_WARN=80
+MEM_CRIT=90
+DISK_MOUNTS="/ /var"
+MAX_RESTARTS=3          # per service...
+RESTART_WINDOW=1800     # ...within 30 min, else back off
+HOOK_TIMEOUT=60
+HTTP_PROBE_URL="http://127.0.0.1/"
+
+# shellcheck source=/dev/null
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+NOW="$(date +%s)"
+
+log()  { logger -t guardian -- "$*" 2>/dev/null || true; echo "[guardian] $*"; }
+warn() { logger -t guardian -p user.warning -- "$*" 2>/dev/null || true; echo "[guardian] WARN: $*" >&2; }
+err()  { logger -t guardian -p user.err -- "$*" 2>/dev/null || true; echo "[guardian] ERROR: $*" >&2; }
+
+# ---- helpers --------------------------------------------------------------
+
+# "90"|"90s"|"30m"|"2h"|"1d" -> seconds ; "" -> "" ; bad -> rc 1
+parse_duration() {
+  local d="${1:-}"
+  [[ -z "$d" ]] && { echo ""; return 0; }
+  [[ "$d" =~ ^([0-9]+)([smhd]?)$ ]] || { echo ""; return 1; }
+  local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+  case "$u" in
+    ""|s) echo "$n" ;; m) echo $((n*60)) ;; h) echo $((n*3600)) ;; d) echo $((n*86400)) ;;
+  esac
+}
+
+# off_active <marker-file> : true if an "off" marker is active (and not expired).
+# File holds an expiry epoch; 0 / no-number = indefinite. Expired files removed.
+off_active() {
+  local f="$1" exp
+  [[ -f "$f" ]] || return 1
+  exp="$(grep -oE '[0-9]{6,}' "$f" 2>/dev/null | head -n1 || true)"
+  [[ -z "$exp" || "$exp" == "0" ]] && return 0
+  (( NOW < exp )) && return 0
+  rm -f "$f" 2>/dev/null || true
+  return 1
+}
+
+off_marker()     { [[ "${1:-}" == "all" || -z "${1:-}" ]] && echo "${ETC_DIR}/off" || echo "${ETC_DIR}/off.$1"; }
+unit_exists()    { systemctl list-unit-files "$1" >/dev/null 2>&1; }
+is_active()      { systemctl is-active --quiet "$1"; }
+
+detect_web()  { if unit_exists apache2.service; then echo apache2; elif unit_exists httpd.service; then echo httpd; fi; }
+detect_db()   { if unit_exists mysql.service;  then echo mysql;   elif unit_exists mariadb.service; then echo mariadb; fi; }
+detect_fpm()  { systemctl list-unit-files 'php*-fpm.service' 2>/dev/null | awk '/-fpm\.service/{print $1}' || true; }
+
+probe_web() {
+  command -v apachectl  >/dev/null 2>&1 && { apachectl  -t >/dev/null 2>&1 || return 1; }
+  command -v apache2ctl >/dev/null 2>&1 && { apache2ctl -t >/dev/null 2>&1 || return 1; }
+  if   command -v curl >/dev/null 2>&1; then curl -fsS --max-time 3 "$HTTP_PROBE_URL" >/dev/null 2>&1 || return 1
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 3 -O /dev/null "$HTTP_PROBE_URL" || return 1
+  fi
+  return 0
+}
+probe_db()  { command -v mysqladmin >/dev/null 2>&1 && { mysqladmin ping --connect-timeout=3 >/dev/null 2>&1 || return 1; }; return 0; }
+probe_fpm() { is_active "$1"; }
+
+# ---- restart with per-service backoff -------------------------------------
+RESTARTED=()
+
+restart_service() {
+  local svc="$1" reason="${2:-unhealthy}" f="${STATE_DIR}/${svc}.restarts"
+  local cutoff=$((NOW - RESTART_WINDOW)) recent=() ts
+  mkdir -p "$STATE_DIR"
+  if [[ -f "$f" ]]; then
+    while IFS= read -r ts; do [[ "$ts" =~ ^[0-9]+$ ]] && (( ts >= cutoff )) && recent+=("$ts"); done < "$f"
+  fi
+  if (( ${#recent[@]} >= MAX_RESTARTS )); then
+    err "${svc}: ${#recent[@]} restarts in $((RESTART_WINDOW/60))m — giving up (needs a human). ${reason}"
+    return 1
+  fi
+  recent+=("$NOW"); printf '%s\n' "${recent[@]}" > "$f"
+  log "${svc}: restarting (${reason}) [$(( ${#recent[@]} ))/${MAX_RESTARTS}]"
+  if systemctl try-restart "$svc" >/dev/null 2>&1 || systemctl restart "$svc" >/dev/null 2>&1; then
+    RESTARTED+=("$svc")
+  else
+    err "${svc}: restart command failed"
+  fi
+}
+
+guard_service() {
+  local svc="$1" probe="$2"
+  [[ -z "$svc" ]] && return 0
+  if off_active "$(off_marker "$svc")"; then log "${svc}: off — leaving alone"; return 0; fi
+  if [[ "${DISK_CRITICAL:-0}" == "1" ]]; then
+    if ! is_active "$svc" || ! "$probe" "$svc"; then warn "${svc}: not healthy but disk is critical — fix disk first, not restarting"; fi
+    return 0
+  fi
+  if ! is_active "$svc"; then restart_service "$svc" "not running" || true; return 0; fi
+  "$probe" "$svc" || restart_service "$svc" "health probe failed" || true
+}
+
+# ---- disk / memory --------------------------------------------------------
+DISK_CRITICAL=0
+mount_pct() { df --output=pcent "$1" 2>/dev/null | awk 'NR==2{gsub(/%/,"");print int($1)}'; }
+
+generic_reclaim() {
+  log "disk: reclaiming space"
+  journalctl --vacuum-time=7d >/dev/null 2>&1 || true
+  command -v apt-get >/dev/null 2>&1 && apt-get clean >/dev/null 2>&1 || true
+  find /var/log -type f -name '*.gz'    -mtime +30 -delete 2>/dev/null || true
+  find /var/log -type f -name '*.[0-9]' -mtime +14 -delete 2>/dev/null || true
+  find /tmp     -type f                 -mtime +3  -delete 2>/dev/null || true
+}
+
+check_disk_mem() {
+  local m pct crit=0
+  for m in $DISK_MOUNTS; do
+    pct="$(mount_pct "$m")"; [[ -z "$pct" ]] && continue
+    if   (( pct >= DISK_CRIT )); then err  "disk ${m}: ${pct}% (critical)"; crit=1
+    elif (( pct >= DISK_WARN )); then warn "disk ${m}: ${pct}% (warn)"; fi
+  done
+  if (( crit )); then
+    DISK_CRITICAL=1
+    generic_reclaim
+    for_each_app run_reclaim          # let apps free their own space
+    crit=0
+    for m in $DISK_MOUNTS; do pct="$(mount_pct "$m")"; [[ -n "$pct" ]] && (( pct >= DISK_CRIT )) && crit=1; done
+    if (( crit )); then err "disk: still critical after reclaim — MANUAL INTERVENTION NEEDED"
+    else log "disk: recovered"; DISK_CRITICAL=0; fi
+  fi
+
+  local mem; mem="$(free 2>/dev/null | awk '/^Mem:/{printf "%d",($3/$2)*100}')"
+  if [[ -n "$mem" ]]; then
+    if   (( mem >= MEM_CRIT )); then warn "memory: ${mem}% (critical) — dropping caches"; sync || true; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    elif (( mem >= MEM_WARN )); then warn "memory: ${mem}% (warn)"; fi
+  fi
+}
+
+# ---- app registry + hooks -------------------------------------------------
+# for_each_app <callback> : calls <callback> NAME ROOT DIR SERVICES for every
+# registered, enabled, non-off app. Each in a subshell, errors swallowed.
+for_each_app() {
+  local cb="$1" conf
+  [[ -d "$APPS_DIR" ]] || return 0
+  shopt -s nullglob
+  for conf in "$APPS_DIR"/*.conf; do
+    ( APP_NAME=""; APP_ROOT=""; GUARDIAN_DIR=""; SERVICES=""; ENABLED=1
+      # shellcheck source=/dev/null
+      source "$conf"
+      [[ -n "$APP_NAME" && -n "$APP_ROOT" ]] || { warn "registry $(basename "$conf"): missing APP_NAME/APP_ROOT"; exit 0; }
+      [[ "${ENABLED:-1}" == "1" ]] || exit 0
+      [[ "$(cat "${APP_ROOT}/var/guardian.enabled" 2>/dev/null || echo yes)" == "no" ]] && exit 0
+      off_active "${APP_ROOT}/var/guardian.off" && { log "${APP_NAME}: off — skipping app hooks"; exit 0; }
+      : "${GUARDIAN_DIR:=${APP_ROOT}/guardian}"
+      "$cb" "$APP_NAME" "$APP_ROOT" "$GUARDIAN_DIR" "${SERVICES:-}"
+    ) || true
+  done
+  shopt -u nullglob
+}
+
+# run_hook NAME ROOT DIR SERVICES HOOK EVENT REASON
+run_hook() {
+  local name="$1" root="$2" dir="$3" svcs="$4" hook="$5" event="${6:-}" reason="${7:-}"
+  [[ -f "${dir}/${hook}" ]] || return 0
+  log "${name}: hook ${hook} (${event})"
+  GUARDIAN_APP="$name" GUARDIAN_APP_ROOT="$root" GUARDIAN_DIR="$dir" GUARDIAN_SERVICES="$svcs" \
+  GUARDIAN_EVENT="$event" GUARDIAN_REASON="$reason" \
+    timeout -k 5 "$HOOK_TIMEOUT" bash "${dir}/${hook}" 2>&1 | sed "s/^/[guardian][${name}:${hook}] /" \
+    || warn "${name}: hook ${hook} failed/timed out"
+  return 0
+}
+
+run_reclaim() { run_hook "$1" "$2" "$3" "$4" reclaim disk_critical "disk critical"; }
+
+app_pass() {            # check -> heal+notify if unhealthy or a dep was restarted
+  local name="$1" root="$2" dir="$3" svcs="$4" event="" reason="" need=0 s r
+  for s in $svcs; do for r in "${RESTARTED[@]:-}"; do [[ "$s" == "$r" ]] && { need=1; event=service_restarted; reason="$r restarted"; }; done; done
+  if [[ -f "${dir}/check" ]]; then
+    local out rc=0
+    out="$(GUARDIAN_APP="$name" GUARDIAN_APP_ROOT="$root" GUARDIAN_DIR="$dir" timeout -k 5 "$HOOK_TIMEOUT" bash "${dir}/check" 2>&1)" || rc=$?
+    if (( rc != 0 )); then need=1; [[ -z "$event" ]] && event=check_failed; reason="${out:-check rc=$rc}"; warn "${name}: check failed: ${out}"; fi
+  fi
+  if (( need )); then
+    run_hook "$name" "$root" "$dir" "$svcs" heal   "$event" "$reason"
+    run_hook "$name" "$root" "$dir" "$svcs" notify "$event" "$reason"
+  fi
+}
+
+drain_requests() {       # app -> hub on-demand trigger
+  local f
+  shopt -s nullglob
+  for f in "$REQ_DIR"/*; do log "on-demand request: $(basename "$f")"; rm -f "$f" 2>/dev/null || true; done
+  shopt -u nullglob
+}
+
+# ---- the tick -------------------------------------------------------------
+do_run() {
+  exec 9>/run/guardian.lock
+  flock -n 9 || { log "another instance running — skip"; exit 0; }
+  if off_active "$(off_marker all)"; then log "guardian is off — standing down"; exit 0; fi
+
+  drain_requests
+  check_disk_mem        # disk first, so disk-critical can suppress restarts
+
+  local web db fpm
+  web="$(detect_web)"; db="$(detect_db)"
+  guard_service "$web" probe_web
+  guard_service "$db"  probe_db
+  while IFS= read -r fpm; do [[ -n "$fpm" ]] && guard_service "$fpm" probe_fpm; done < <(detect_fpm)
+
+  for_each_app app_pass
+  log "done (restarted: ${RESTARTED[*]:-none})"
+}
+
+# ---- off / on / status ----------------------------------------------------
+do_off() {
+  mkdir -p "$ETC_DIR"
+  local target="${1:-all}" secs exp f; f="$(off_marker "$target")"
+  secs="$(parse_duration "${2:-}")" || { err "bad duration: ${2}"; exit 2; }
+  if [[ -z "$secs" ]]; then echo 0 > "$f"; log "${target}: off (indefinite). 'guardian on ${target/all/}' to resume."
+  else exp=$((NOW+secs)); echo "$exp" > "$f"; log "${target}: off until $(date -d "@$exp" 2>/dev/null || echo "+${secs}s")."; fi
+}
+do_on()  { local target="${1:-all}"; rm -f "$(off_marker "$target")" 2>/dev/null || true; log "${target}: on."; }
+
+do_status() {
+  echo "guardian status"
+  off_active "$(off_marker all)" && echo "  guardian: OFF" || echo "  guardian: on"
+  echo "  services:"
+  local s; for s in "$(detect_web)" "$(detect_db)" $(detect_fpm); do
+    [[ -z "$s" ]] && continue
+    local st; st="$(is_active "$s" && echo active || echo INACTIVE)"
+    off_active "$(off_marker "$s")" && st="$st (off)"
+    printf "    %-22s %s\n" "$s" "$st"
+  done
+  local n=0
+  if [[ -d "$APPS_DIR" ]]; then
+    shopt -s nullglob
+    for conf in "$APPS_DIR"/*.conf; do
+      n=$((n+1)); [[ $n == 1 ]] && echo "  apps:"
+      ( APP_NAME=""; APP_ROOT=""; ENABLED=1; source "$conf"
+        local state=on
+        [[ "${ENABLED:-1}" == "1" ]] || state="off(conf)"
+        [[ "$(cat "${APP_ROOT}/var/guardian.enabled" 2>/dev/null || echo yes)" == "no" ]] && state="off(ui)"
+        off_active "${APP_ROOT}/var/guardian.off" && state="off"
+        printf "    %-14s %-26s %s\n" "${APP_NAME:-?}" "${APP_ROOT:-?}" "$state" )
+    done
+    shopt -u nullglob
+  fi
+}
+
+main() {
+  if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi
+  mkdir -p "$STATE_DIR" "$REQ_DIR" 2>/dev/null || true
+  case "${1:-run}" in
+    run)            do_run ;;
+    status)         do_status ;;
+    off)            shift; do_off "${1:-all}" "${2:-}" ;;
+    on)             shift; do_on  "${1:-all}" ;;
+    -h|--help|help) sed -n '3,30p' "$0" | sed 's/^#\s\?//' ;;
+    *) err "unknown command: ${1}"; echo "usage: guardian {run|status|off [svc] [dur]|on [svc]}" >&2; exit 2 ;;
+  esac
+}
+
+# Allow sourcing for tests without running main.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then main "$@"; fi

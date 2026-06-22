@@ -1,0 +1,17 @@
+# Register an app with guardian by copying this to /etc/guardian/apps.d/<name>.conf
+# (key=value, sourced by bash — no spaces around =).
+
+APP_NAME=myapp
+APP_ROOT=/var/www/myapp
+
+# Where the app's hook scripts live (default: $APP_ROOT/guardian).
+# Hooks are all optional: check, heal, reclaim, notify.
+GUARDIAN_DIR=/var/www/myapp/guardian
+
+# Services this app depends on. If guardian restarts one of these, it will run
+# the app's "heal" hook afterwards.
+SERVICES="apache2 mysql"
+
+# Box-level on/off for this app's hooks (1 = on). The app can also turn itself
+# off at runtime via $APP_ROOT/var/guardian.off or var/guardian.enabled=no.
+ENABLED=1
