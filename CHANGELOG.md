@@ -3,6 +3,11 @@
 All notable changes to guardian are recorded here. The version lives in the
 `guardian` script (`VERSION=`); run `guardian version` to see what's installed.
 
+## 0.1.1
+
+- `guardian help` now prints a clean, portable usage block (the old version
+  leaked raw `#` comment lines and spilled past the header on BSD/macOS sed).
+
 ## 0.1.0
 
 Initial release.

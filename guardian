@@ -31,7 +31,7 @@ set -uo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Single source of truth for the version. Bump on each release; see CHANGELOG.md.
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # ---- defaults (override in /etc/guardian/guardian.conf) -------------------
 ETC_DIR=/etc/guardian
@@ -289,6 +289,30 @@ do_status() {
 # Escalate only for commands that need it (run/off/on write to /etc or restart services).
 need_root() { if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi; }
 
+usage() {
+  cat <<EOF
+guardian ${VERSION} — self-healing for single-box LAMP servers
+
+Usage: guardian <command>
+
+  run                 run one healing pass now (the systemd timer does this)
+  status              show what's guarded and what's off
+  off [svc] [dur]     turn guardian off entirely, or just one service
+                      dur: 90s, 30m, 2h, 1d  (omit = until you run 'on')
+  on  [svc]           re-enable guardian, or one service
+  version             print the version
+  help                show this help
+
+Examples:
+  guardian off mysql        leave MySQL alone (e.g. you stopped it on purpose)
+  guardian off apache2 2h   ...for 2 hours, then auto-resume
+  guardian on  mysql        guard it again
+
+Logs:  journalctl -t guardian -n 50
+Docs:  https://github.com/deforay/guardian
+EOF
+}
+
 main() {
   case "${1:-run}" in
     run)            need_root "$@"; mkdir -p "$STATE_DIR" "$REQ_DIR" 2>/dev/null || true; do_run ;;
@@ -296,8 +320,8 @@ main() {
     on)             need_root "$@"; shift; do_on  "${1:-all}" ;;
     status)         do_status ;;
     version|-v|--version) echo "guardian ${VERSION}" ;;
-    -h|--help|help) sed -n '3,30p' "$0" | sed 's/^#\s\?//' ;;
-    *) err "unknown command: ${1}"; echo "usage: guardian {run|status|off [svc] [dur]|on [svc]|version}" >&2; exit 2 ;;
+    -h|--help|help) usage ;;
+    *) err "unknown command: ${1}"; usage >&2; exit 2 ;;
   esac
 }
 
