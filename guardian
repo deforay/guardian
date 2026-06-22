@@ -30,6 +30,9 @@
 set -uo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Single source of truth for the version. Bump on each release; see CHANGELOG.md.
+VERSION="0.1.0"
+
 # ---- defaults (override in /etc/guardian/guardian.conf) -------------------
 ETC_DIR=/etc/guardian
 CONF_FILE="${ETC_DIR}/guardian.conf"
@@ -258,7 +261,7 @@ do_off() {
 do_on()  { local target="${1:-all}"; rm -f "$(off_marker "$target")" 2>/dev/null || true; log "${target}: on."; }
 
 do_status() {
-  echo "guardian status"
+  echo "guardian v${VERSION}"
   off_active "$(off_marker all)" && echo "  guardian: OFF" || echo "  guardian: on"
   echo "  services:"
   local s; for s in "$(detect_web)" "$(detect_db)" $(detect_fpm); do
@@ -283,16 +286,18 @@ do_status() {
   fi
 }
 
+# Escalate only for commands that need it (run/off/on write to /etc or restart services).
+need_root() { if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi; }
+
 main() {
-  if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi
-  mkdir -p "$STATE_DIR" "$REQ_DIR" 2>/dev/null || true
   case "${1:-run}" in
-    run)            do_run ;;
+    run)            need_root "$@"; mkdir -p "$STATE_DIR" "$REQ_DIR" 2>/dev/null || true; do_run ;;
+    off)            need_root "$@"; shift; do_off "${1:-all}" "${2:-}" ;;
+    on)             need_root "$@"; shift; do_on  "${1:-all}" ;;
     status)         do_status ;;
-    off)            shift; do_off "${1:-all}" "${2:-}" ;;
-    on)             shift; do_on  "${1:-all}" ;;
+    version|-v|--version) echo "guardian ${VERSION}" ;;
     -h|--help|help) sed -n '3,30p' "$0" | sed 's/^#\s\?//' ;;
-    *) err "unknown command: ${1}"; echo "usage: guardian {run|status|off [svc] [dur]|on [svc]}" >&2; exit 2 ;;
+    *) err "unknown command: ${1}"; echo "usage: guardian {run|status|off [svc] [dur]|on [svc]|version}" >&2; exit 2 ;;
   esac
 }
 

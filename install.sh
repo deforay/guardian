@@ -100,7 +100,8 @@ main() {
   systemctl enable --now guardian.timer >/dev/null 2>&1 || true
   systemctl enable --now guardian-trigger.path >/dev/null 2>&1 || true
 
-  echo "Done."
+  local ver; ver="$(grep -m1 '^VERSION=' "${SRC_DIR}/guardian" | cut -d'"' -f2)"
+  echo "Done (guardian ${ver:-?})."
   echo "  status: guardian status   (or: systemctl status guardian.timer)"
   echo "  logs:   journalctl -t guardian -n 50"
 }

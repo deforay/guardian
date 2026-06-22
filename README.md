@@ -40,6 +40,7 @@ sudo ./install.sh --uninstall
 ## Use
 
 ```bash
+guardian version           # installed version
 guardian status            # what's guarded, what's off
 guardian run               # run one pass now (the timer does this for you)
 

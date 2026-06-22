@@ -18,6 +18,9 @@ echo "syntax"
 bash -n "${DIR}/guardian"      && ok "guardian parses"     || bad "guardian parse"
 bash -n "${DIR}/install.sh"    && ok "install.sh parses"   || bad "install.sh parse"
 
+echo "version"
+if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ok "VERSION is semver ($VERSION)"; else bad "VERSION not semver ($VERSION)"; fi
+
 echo "parse_duration"
 eq "blank"  "$(parse_duration '')"     ""
 eq "secs"   "$(parse_duration '90')"   "90"
