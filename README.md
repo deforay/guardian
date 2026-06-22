@@ -19,22 +19,24 @@ the box's services.
 
 ## Install
 
+One line — clones to `/opt/guardian`, installs, and enables the timer. Re-run the
+same line anytime to update (it pulls latest; only changed files are touched):
+
 ```bash
-git clone git@github.com:deforay/guardian.git
-cd guardian
-sudo ./install.sh
+sudo bash -c 'git clone https://github.com/deforay/guardian.git /opt/guardian 2>/dev/null || git -C /opt/guardian pull -q; /opt/guardian/install.sh'
 ```
 
-Optional: also let systemd instantly bounce a crashed Apache/MySQL between ticks:
+Optional: also let systemd instantly bounce a crashed Apache/MySQL between ticks —
+append `--harden`:
 
 ```bash
-sudo ./install.sh --harden
+sudo /opt/guardian/install.sh --harden
 ```
 
 Remove it:
 
 ```bash
-sudo ./install.sh --uninstall
+sudo /opt/guardian/install.sh --uninstall
 ```
 
 ## Use
