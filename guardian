@@ -20,8 +20,12 @@
 # Commands:
 #   guardian run            one healing pass (what the timer calls)
 #   guardian status         show what's guarded / off
+#   guardian logs [-f]      tail guardian's journal
 #   guardian off [svc] [dur]   disable guardian, or just one service (dur: 30m,2h,90s)
 #   guardian on  [svc]         re-enable
+#
+# Set ALERT_CMD in /etc/guardian/guardian.conf to be notified when guardian hits
+# something it can't fix on its own.
 #
 # https://github.com/deforay/guardian
 
@@ -31,7 +35,7 @@ set -uo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Single source of truth for the version. Bump on each release; see CHANGELOG.md.
-VERSION="0.1.1"
+VERSION="0.2.0"
 
 # ---- defaults (override in /etc/guardian/guardian.conf) -------------------
 ETC_DIR=/etc/guardian
@@ -50,6 +54,14 @@ RESTART_WINDOW=1800     # ...within 30 min, else back off
 HOOK_TIMEOUT=60
 HTTP_PROBE_URL="http://127.0.0.1/"
 
+# Optional: a shell command guardian runs when it hits something it can't fix by
+# itself (a service that keeps failing, a disk still critical after reclaim,
+# memory pinned). Empty = no alerting (the default). See examples/guardian.conf.example.
+#   subject -> $1 and $GUARDIAN_SUBJECT ; body -> stdin ; host -> $GUARDIAN_HOST
+ALERT_CMD=""
+ALERT_TIMEOUT=15        # kill the alert command after this many seconds
+ALERT_THROTTLE=3600     # min seconds between alerts of the same kind (avoid storms)
+
 # shellcheck source=/dev/null
 [[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
 NOW="$(date +%s)"
@@ -57,6 +69,32 @@ NOW="$(date +%s)"
 log()  { logger -t guardian -- "$*" 2>/dev/null || true; echo "[guardian] $*"; }
 warn() { logger -t guardian -p user.warning -- "$*" 2>/dev/null || true; echo "[guardian] WARN: $*" >&2; }
 err()  { logger -t guardian -p user.err -- "$*" 2>/dev/null || true; echo "[guardian] ERROR: $*" >&2; }
+
+# alert <key> <subject> [body] : fire ALERT_CMD for a can't-self-heal event.
+# No-op unless ALERT_CMD is set. Throttled per <key> so a stuck condition that
+# recurs every tick doesn't page someone every minute.
+alert() {
+  [[ -n "${ALERT_CMD:-}" ]] || return 0
+  local key="$1" subj="$2" body="${3:-}" last=0
+  local sf="${STATE_DIR}/alert.${key}"
+  [[ -f "$sf" ]] && last="$(cat "$sf" 2>/dev/null || echo 0)"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( NOW - last < ${ALERT_THROTTLE:-3600} )) && return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true; echo "$NOW" > "$sf" 2>/dev/null || true
+  printf '%s\n' "$body" | GUARDIAN_SUBJECT="$subj" GUARDIAN_HOST="$(hostname 2>/dev/null || echo localhost)" \
+    timeout -k 5 "${ALERT_TIMEOUT:-15}" bash -c "$ALERT_CMD" guardian-alert "$subj" 2>/dev/null \
+    || warn "alert: command failed"
+}
+
+# human_dur <seconds> -> "1h20m" / "45s" (compact, for status/logs).
+human_dur() {
+  local s="${1:-0}" out=""
+  (( s >= 86400 )) && { out+="$((s/86400))d"; s=$((s%86400)); }
+  (( s >= 3600  )) && { out+="$((s/3600))h";  s=$((s%3600)); }
+  (( s >= 60    )) && { out+="$((s/60))m";    s=$((s%60)); }
+  [[ -z "$out" ]] && out="${s}s"
+  echo "$out"
+}
 
 # ---- helpers --------------------------------------------------------------
 
@@ -90,6 +128,36 @@ is_active()      { systemctl is-active --quiet "$1"; }
 detect_web()  { if unit_exists apache2.service; then echo apache2; elif unit_exists httpd.service; then echo httpd; fi; }
 detect_db()   { if unit_exists mysql.service;  then echo mysql;   elif unit_exists mariadb.service; then echo mariadb; fi; }
 detect_fpm()  { systemctl list-unit-files 'php*-fpm.service' 2>/dev/null | awk '/-fpm\.service/{print $1}' || true; }
+guarded_services() { detect_web; detect_db; detect_fpm; }
+
+# resolve_service <name> : map a user-typed name to the unit guardian actually
+# guards here, so `off mysql` works on a box whose DB unit is `mariadb` (and
+# `off apache2` on an `httpd` box). Echoes the resolved name; rc 1 if the box
+# guards nothing by that name (caller warns but still writes the marker).
+resolve_service() {
+  local in="${1:-}" web db s
+  [[ "$in" == "all" || -z "$in" ]] && { echo "all"; return 0; }
+  in="${in%.service}"
+  web="$(detect_web)"; db="$(detect_db)"
+  case "$in" in
+    apache2|httpd|apache)        [[ -n "$web" ]] && { echo "$web"; return 0; } ;;
+    mysql|mariadb|mysqld|maria)  [[ -n "$db"  ]] && { echo "$db";  return 0; } ;;
+  esac
+  for s in $web $db $(detect_fpm); do
+    [[ "$in" == "${s%.service}" ]] && { echo "$s"; return 0; }
+  done
+  echo "$in"; return 1
+}
+
+# off_detail <marker> : "" if not off, else " (off)" or " (off until HH:MM, 1h20m)".
+off_detail() {
+  local f="$1" exp rem
+  off_active "$f" || { echo ""; return 0; }
+  exp="$(grep -oE '[0-9]{6,}' "$f" 2>/dev/null | head -n1 || true)"
+  [[ -z "$exp" || "$exp" == "0" ]] && { echo " (off)"; return 0; }
+  rem=$((exp - NOW)); (( rem < 0 )) && rem=0
+  echo " (off until $(date -d "@$exp" '+%H:%M' 2>/dev/null || echo "+${rem}s"), $(human_dur "$rem"))"
+}
 
 probe_web() {
   command -v apachectl  >/dev/null 2>&1 && { apachectl  -t >/dev/null 2>&1 || return 1; }
@@ -114,6 +182,8 @@ restart_service() {
   fi
   if (( ${#recent[@]} >= MAX_RESTARTS )); then
     err "${svc}: ${#recent[@]} restarts in $((RESTART_WINDOW/60))m — giving up (needs a human). ${reason}"
+    alert "restart.${svc}" "${svc} keeps failing — guardian gave up" \
+      "${svc} was restarted ${#recent[@]} times in $((RESTART_WINDOW/60)) minutes and is still unhealthy (${reason}). guardian has stopped restarting it; it needs a human."
     return 1
   fi
   recent+=("$NOW"); printf '%s\n' "${recent[@]}" > "$f"
@@ -163,13 +233,19 @@ check_disk_mem() {
     for_each_app run_reclaim          # let apps free their own space
     crit=0
     for m in $DISK_MOUNTS; do pct="$(mount_pct "$m")"; [[ -n "$pct" ]] && (( pct >= DISK_CRIT )) && crit=1; done
-    if (( crit )); then err "disk: still critical after reclaim — MANUAL INTERVENTION NEEDED"
+    if (( crit )); then
+      err "disk: still critical after reclaim — MANUAL INTERVENTION NEEDED"
+      alert "disk" "disk still critical after reclaim" \
+        "One or more of these mounts is >= ${DISK_CRIT}% and guardian could not free enough space: ${DISK_MOUNTS}. Services are not being restarted until the disk recovers."
     else log "disk: recovered"; DISK_CRITICAL=0; fi
   fi
 
   local mem; mem="$(free 2>/dev/null | awk '/^Mem:/{printf "%d",($3/$2)*100}')"
   if [[ -n "$mem" ]]; then
-    if   (( mem >= MEM_CRIT )); then warn "memory: ${mem}% (critical) — dropping caches"; sync || true; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    if   (( mem >= MEM_CRIT )); then
+      warn "memory: ${mem}% (critical) — dropping caches"; sync || true; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+      alert "mem" "memory critical (${mem}%)" \
+        "Memory use is at ${mem}% (>= ${MEM_CRIT}%). guardian dropped reclaimable caches, but that won't help if a process is genuinely leaking — this may need a human."
     elif (( mem >= MEM_WARN )); then warn "memory: ${mem}% (warn)"; fi
   fi
 }
@@ -253,22 +329,42 @@ do_run() {
 # ---- off / on / status ----------------------------------------------------
 do_off() {
   mkdir -p "$ETC_DIR"
-  local target="${1:-all}" secs exp f; f="$(off_marker "$target")"
+  local in="${1:-all}" target secs exp f
+  target="$(resolve_service "$in")" || warn "'${in}' isn't a service guardian guards here (guarding: $(guarded_services | tr '\n' ' ')). Writing the marker anyway in case it appears later."
+  f="$(off_marker "$target")"
   secs="$(parse_duration "${2:-}")" || { err "bad duration: ${2}"; exit 2; }
-  if [[ -z "$secs" ]]; then echo 0 > "$f"; log "${target}: off (indefinite). 'guardian on ${target/all/}' to resume."
-  else exp=$((NOW+secs)); echo "$exp" > "$f"; log "${target}: off until $(date -d "@$exp" 2>/dev/null || echo "+${secs}s")."; fi
+  if [[ -z "$secs" ]]; then
+    echo 0 > "$f"
+    [[ "$target" == "all" ]] && log "all: off (indefinite). 'guardian on' to resume." \
+                             || log "${target}: off (indefinite). 'guardian on ${target}' to resume."
+  else
+    exp=$((NOW+secs)); echo "$exp" > "$f"
+    log "${target}: off until $(date -d "@$exp" 2>/dev/null || echo "+${secs}s") ($(human_dur "$secs"))."
+  fi
 }
-do_on()  { local target="${1:-all}"; rm -f "$(off_marker "$target")" 2>/dev/null || true; log "${target}: on."; }
+do_on() {
+  local in="${1:-all}" target removed=0 f fr
+  target="$(resolve_service "$in")"   # echoes the input unchanged if it doesn't match a guarded unit
+  f="$(off_marker "$target")"
+  [[ -f "$f" ]] && { rm -f "$f" 2>/dev/null && removed=1; }
+  # Also clear a marker left under the raw alias by an older guardian (e.g. off.mysql on a mariadb box).
+  fr="$(off_marker "$in")"
+  [[ "$fr" != "$f" && -f "$fr" ]] && { rm -f "$fr" 2>/dev/null && removed=1; }
+  if (( removed )); then log "${target}: on."; else log "${target}: already on (nothing was off)."; fi
+}
 
 do_status() {
+  local unhealthy=0 global_off=0
   echo "guardian v${VERSION}"
-  off_active "$(off_marker all)" && echo "  guardian: OFF" || echo "  guardian: on"
+  if off_active "$(off_marker all)"; then echo "  guardian: OFF$(off_detail "$(off_marker all)")"; global_off=1
+  else echo "  guardian: on"; fi
   echo "  services:"
   local s; for s in "$(detect_web)" "$(detect_db)" $(detect_fpm); do
     [[ -z "$s" ]] && continue
-    local st; st="$(is_active "$s" && echo active || echo INACTIVE)"
-    off_active "$(off_marker "$s")" && st="$st (off)"
-    printf "    %-22s %s\n" "$s" "$st"
+    local st off; st="$(is_active "$s" && echo active || echo INACTIVE)"
+    off="$(off_detail "$(off_marker "$s")")"
+    [[ "$st" == INACTIVE && -z "$off" && $global_off -eq 0 ]] && unhealthy=1
+    printf "    %-22s %s%s\n" "$s" "$st" "$off"
   done
   local n=0
   if [[ -d "$APPS_DIR" ]]; then
@@ -284,6 +380,25 @@ do_status() {
     done
     shopt -u nullglob
   fi
+  return $unhealthy   # non-zero if a guarded service is down and not deliberately off
+}
+
+# guardian logs [-f] [-n N] : tail guardian's journal without memorising the incantation.
+do_logs() {
+  local follow=0 n=50
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=1 ;;
+      -n) shift; n="${1:-50}" ;;
+      -n*) n="${1#-n}" ;;
+      *) err "logs: unknown option '$1'"; return 2 ;;
+    esac
+    shift
+  done
+  if ! command -v journalctl >/dev/null 2>&1; then err "journalctl not found on this system"; return 1; fi
+  local cmd=(journalctl -t guardian -n "$n" --no-pager)
+  (( follow )) && cmd=(journalctl -t guardian -n "$n" -f)
+  "${cmd[@]}"
 }
 
 # Escalate only for commands that need it (run/off/on write to /etc or restart services).
@@ -296,7 +411,9 @@ guardian ${VERSION} — self-healing for single-box LAMP servers
 Usage: guardian <command>
 
   run                 run one healing pass now (the systemd timer does this)
-  status              show what's guarded and what's off
+  status              show what's guarded and what's off (exits non-zero if a
+                      guarded service is down and not deliberately off)
+  logs [-f] [-n N]    show guardian's recent log lines (-f to follow)
   off [svc] [dur]     turn guardian off entirely, or just one service
                       dur: 90s, 30m, 2h, 1d  (omit = until you run 'on')
   on  [svc]           re-enable guardian, or one service
@@ -304,12 +421,14 @@ Usage: guardian <command>
   help                show this help
 
 Examples:
-  guardian off mysql        leave MySQL alone (e.g. you stopped it on purpose)
+  guardian off mysql        leave the DB alone (matches mysql OR mariadb here)
   guardian off apache2 2h   ...for 2 hours, then auto-resume
   guardian on  mysql        guard it again
+  guardian logs -f          watch what guardian is doing live
 
-Logs:  journalctl -t guardian -n 50
-Docs:  https://github.com/deforay/guardian
+Alerts: set ALERT_CMD in /etc/guardian/guardian.conf to get paged when guardian
+        hits something it can't fix. See examples/guardian.conf.example.
+Docs:   https://github.com/deforay/guardian
 EOF
 }
 
@@ -319,6 +438,7 @@ main() {
     off)            need_root "$@"; shift; do_off "${1:-all}" "${2:-}" ;;
     on)             need_root "$@"; shift; do_on  "${1:-all}" ;;
     status)         do_status ;;
+    logs)           shift; do_logs "$@" ;;
     version|-v|--version) echo "guardian ${VERSION}" ;;
     -h|--help|help) usage ;;
     *) err "unknown command: ${1}"; usage >&2; exit 2 ;;

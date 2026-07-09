@@ -3,6 +3,24 @@
 All notable changes to guardian are recorded here. The version lives in the
 `guardian` script (`VERSION=`); run `guardian version` to see what's installed.
 
+## 0.2.0
+
+- **Service-name aliases.** `guardian off mysql` / `on mysql` now resolve to the
+  DB unit the box actually runs (`mysql` **or** `mariadb`), and `apache2`↔`httpd`
+  likewise. Previously, on a box whose unit was `mariadb`/`httpd`, `off mysql`
+  silently created a marker guardian never checked and kept restarting the
+  service anyway. A name the box doesn't guard now prints a warning listing what
+  it does guard. `on` also cleans up any stale marker left under the old alias.
+- **Alerting.** New optional `ALERT_CMD` (set in `guardian.conf`) fires when
+  guardian hits something it can't self-heal: a service that exhausted its
+  restart budget, a disk still critical after reclaim, or memory critically high.
+  Throttled per-kind (`ALERT_THROTTLE`, default 1h) so a stuck box doesn't page
+  every tick. Email/ntfy/Slack one-liners in `examples/guardian.conf.example`.
+- **`guardian logs [-f] [-n N]`** — shortcut for `journalctl -t guardian`.
+- **`guardian status`** now shows when a timed pause expires (`off until 15:04,
+  1h20m`) and exits non-zero when a guarded service is down and not deliberately
+  off — so it drops straight into a monitoring check.
+
 ## 0.1.1
 
 - `guardian help` now prints a clean, portable usage block (the old version

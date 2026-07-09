@@ -1,0 +1,39 @@
+# guardian.conf — optional overrides. Copy to /etc/guardian/guardian.conf and
+# edit. Every setting has a sensible default; you only need what you want to change.
+# (key=value, sourced by bash — no spaces around =.)
+
+# --- thresholds ------------------------------------------------------------
+#DISK_WARN=85
+#DISK_CRIT=95
+#MEM_WARN=80
+#MEM_CRIT=90
+#DISK_MOUNTS="/ /var"
+
+# --- restart backoff -------------------------------------------------------
+#MAX_RESTARTS=3          # give up after this many restarts of one service...
+#RESTART_WINDOW=1800     # ...within this many seconds, then alert + leave it
+
+# --- health probe ----------------------------------------------------------
+#HTTP_PROBE_URL="http://127.0.0.1/"
+#HOOK_TIMEOUT=60
+
+# --- alerting (off by default) ---------------------------------------------
+# ALERT_CMD runs when guardian hits something it can NOT fix by itself:
+#   - a service exhausted its restart budget and is still failing
+#   - a disk is still critical after guardian tried to reclaim space
+#   - memory is critically high
+# It receives:  subject as $1 (and $GUARDIAN_SUBJECT), the host as $GUARDIAN_HOST,
+# and a human-readable body on stdin. Alerts of the same kind are throttled to
+# once per ALERT_THROTTLE seconds so a stuck condition doesn't page every minute.
+#
+# Email (mailutils / bsd-mailx):
+#ALERT_CMD='mail -s "[guardian:$GUARDIAN_HOST] $1" you@example.com'
+#
+# ntfy.sh push:
+#ALERT_CMD='curl -fsS -H "Title: guardian: $GUARDIAN_HOST" -d "$(cat)" https://ntfy.sh/your-topic'
+#
+# Slack incoming webhook:
+#ALERT_CMD='curl -fsS -X POST -H "Content-type: application/json" -d "{\"text\":\"[$GUARDIAN_HOST] $1\"}" https://hooks.slack.com/services/XXX/YYY/ZZZ'
+#
+#ALERT_TIMEOUT=15        # kill the alert command after this many seconds
+#ALERT_THROTTLE=3600     # min seconds between alerts of the same kind

@@ -51,6 +51,26 @@ eq "all marker"   "$(off_marker all)"   "/etc/guardian/off"
 eq "empty marker" "$(off_marker '')"    "/etc/guardian/off"
 eq "svc marker"   "$(off_marker mysql)" "/etc/guardian/off.mysql"
 
+echo "human_dur"
+eq "seconds" "$(human_dur 45)"    "45s"
+eq "minutes" "$(human_dur 90)"    "1m"
+eq "hours"   "$(human_dur 7200)"  "2h"
+eq "mixed"   "$(human_dur 4830)"  "1h20m"
+eq "day"     "$(human_dur 90000)" "1d1h"
+eq "zero"    "$(human_dur 0)"     "0s"
+
+echo "off_detail"
+f="${tmp}/od_off"; echo 0 > "$f"
+eq "indefinite" "$(off_detail "$f")" " (off)"
+f="${tmp}/od_none"
+eq "not off"    "$(off_detail "$f")" ""
+
+echo "resolve_service"
+# 'all' and unknown names are resolvable without systemctl (safe on any box).
+eq "all passes through" "$(resolve_service all)" "all"
+if resolve_service bogus-xyz >/dev/null 2>&1; then bad "unknown service -> rc 1"; else ok "unknown service -> rc 1"; fi
+eq "unknown echoes input" "$(resolve_service bogus-xyz 2>/dev/null)" "bogus-xyz"
+
 rm -rf "$tmp"
 echo
 echo "passed=${pass} failed=${fail}"

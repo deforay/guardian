@@ -43,11 +43,13 @@ sudo /opt/guardian/install.sh --uninstall
 
 ```bash
 guardian version           # installed version
-guardian status            # what's guarded, what's off
+guardian status            # what's guarded, what's off (exits non-zero if a
+                           #   guarded service is down and not deliberately off)
+guardian logs              # recent guardian log lines  (guardian logs -f to follow)
 guardian run               # run one pass now (the timer does this for you)
 
 guardian off               # turn guardian off entirely
-guardian off mysql         # leave MySQL alone (e.g. you stopped it on purpose)
+guardian off mysql         # leave the DB alone (e.g. you stopped it on purpose)
 guardian off apache2 2h    # ...for 2 hours, then auto-resume
 guardian on  mysql         # guard it again
 guardian on                # turn everything back on
@@ -55,11 +57,32 @@ guardian on                # turn everything back on
 
 Durations: `90` or `90s`, `30m`, `2h`, `1d`. No duration = until you turn it back on.
 
-Logs go to the journal:
+Service names are matched to what's actually on the box: `guardian off mysql`
+works whether the unit is `mysql` or `mariadb`, and `off apache2` works on an
+`httpd` box. Give a name it doesn't guard and it says so instead of silently
+doing nothing. `guardian status` shows when a timed pause expires.
+
+Logs go to the journal; `guardian logs` is a shortcut for:
 
 ```bash
 journalctl -t guardian -n 50
 ```
+
+## Getting alerted (optional)
+
+guardian heals what it can, but some things need a human — a service that keeps
+crashing, a disk still full after cleanup, memory pinned. By default it just logs
+those. Set `ALERT_CMD` in `/etc/guardian/guardian.conf` and guardian will run it
+on exactly those can't-self-heal events (throttled, so a stuck box doesn't page
+you every minute). The subject arrives as `$1`, a description on stdin:
+
+```sh
+# /etc/guardian/guardian.conf  — email via mailutils:
+ALERT_CMD='mail -s "[guardian:$GUARDIAN_HOST] $1" you@example.com'
+```
+
+See [`examples/guardian.conf.example`](examples/guardian.conf.example) for ntfy
+and Slack one-liners and every other tunable (thresholds, backoff, probe URL).
 
 ## How it decides
 
@@ -150,6 +173,7 @@ guardian                       the runtime (installed to /usr/local/sbin/guardia
 install.sh                     idempotent installer / uninstaller
 systemd/                       service, timer, on-demand path unit, tmpfiles
 examples/app.conf.example      a registration file to copy
+examples/guardian.conf.example optional config (thresholds, alerting) to copy
 tests/test.sh                  tests for the pure helpers
 ```
 
