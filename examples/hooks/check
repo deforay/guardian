@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# guardian 'check' hook — runs EVERY pass. Exit non-zero (and print a one-line
+# reason on stdout) if the app is unhealthy; exit 0 if it's fine. Keep it fast
+# and side-effect-free: this is a probe, not a repair. Repairs go in 'heal'.
+#
+# Available in the environment: GUARDIAN_APP, GUARDIAN_APP_ROOT, GUARDIAN_DIR.
+set -uo pipefail
+
+# Example: the app serves a health endpoint that also pings its own DB.
+if ! curl -fsS --max-time 5 http://127.0.0.1/health.php >/dev/null 2>&1; then
+  echo "health endpoint not responding"
+  exit 1
+fi
+
+# Example: a background queue worker that must always be running.
+if ! pgrep -f 'myapp queue:work' >/dev/null 2>&1; then
+  echo "queue worker not running"
+  exit 1
+fi
+
+exit 0

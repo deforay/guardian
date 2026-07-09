@@ -20,6 +20,9 @@ All notable changes to guardian are recorded here. The version lives in the
 - **`guardian status`** now shows when a timed pause expires (`off until 15:04,
   1h20m`) and exits non-zero when a guarded service is down and not deliberately
   off — so it drops straight into a monitoring check.
+- Docs: added Requirements, Configuration (all tunables + defaults) and a
+  Troubleshooting/FAQ section to the README, plus runnable sample hooks under
+  `examples/hooks/`.
 
 ## 0.1.1
 

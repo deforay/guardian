@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# guardian 'heal' hook — runs after 'check' fails, OR after a service this app
+# depends on (its SERVICES) was restarted. Do app-specific recovery here. Runs as
+# root and is time-boxed (HOOK_TIMEOUT); if it hangs, guardian kills it and moves
+# on. Make it idempotent — it may run again next pass if the app is still sick.
+#
+# Why the trouble: GUARDIAN_EVENT is one of check_failed | service_restarted,
+# GUARDIAN_REASON is a short human string.
+set -uo pipefail
+cd "${GUARDIAN_APP_ROOT:-/var/www/myapp}" || exit 0
+
+echo "healing after: ${GUARDIAN_EVENT:-?} (${GUARDIAN_REASON:-})"
+
+# Bring the queue worker back if it died.
+if ! pgrep -f 'myapp queue:work' >/dev/null 2>&1; then
+  systemctl try-restart myapp-worker.service 2>/dev/null || true
+fi
+
+# A DB bounce can leave a wedged cache — clear it so the app reconnects cleanly.
+rm -rf var/cache/* 2>/dev/null || true
+
+# Fix writable dirs a bad deploy may have left root-owned.
+chown -R www-data:www-data var/ 2>/dev/null || true

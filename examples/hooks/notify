@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# guardian 'notify' hook — runs after a 'heal'. Record the event somewhere the app
+# or a human can surface it later (a log the app's dashboard tails, a webhook, a
+# row in a table). Keep it quick and never let it fail loudly — a broken notify is
+# logged and ignored, it never blocks guardian.
+set -uo pipefail
+cd "${GUARDIAN_APP_ROOT:-/var/www/myapp}" || exit 0
+
+printf '%s guardian: %s (%s)\n' \
+  "$(date -Is)" "${GUARDIAN_EVENT:-?}" "${GUARDIAN_REASON:-}" \
+  >> var/log/guardian-events.log 2>/dev/null || true

@@ -17,6 +17,20 @@ the box's services.
 > On a mod_php box there's nothing to guard separately — PHP runs inside Apache,
 > so guarding Apache already covers it. Nothing to configure either way.
 
+## Requirements
+
+- **Linux with systemd** — guardian runs from a systemd timer and path unit.
+- **bash** (4+) and **root** — it restarts services, writes under `/etc`, and can
+  drop caches, so the timer runs as root.
+- Standard tools that ship with a server install: `df`, `free`, `find`,
+  `timeout`, `flock`, `logger`, and `journalctl` (for `guardian logs`). `curl` or
+  `wget` is used for the optional HTTP probe; `git` for the one-line install.
+- **No language runtimes or packages to install** — it's one bash script.
+
+Developed and tested on **Ubuntu 22.04**. Both service-name families are
+auto-detected, so Debian/Ubuntu (`apache2`, `mysql`) and RHEL-family —
+CentOS/Rocky/Alma (`httpd`, `mariadb`) — are handled without configuration.
+
 ## Install
 
 One line — clones to `/opt/guardian`, installs, and enables the timer. Re-run the
@@ -68,21 +82,48 @@ Logs go to the journal; `guardian logs` is a shortcut for:
 journalctl -t guardian -n 50
 ```
 
-## Getting alerted (optional)
+## Configuration
+
+guardian works out of the box with no config. To change a default, create
+`/etc/guardian/guardian.conf` (it's sourced as bash — `KEY=value`, no spaces
+around `=`). Copy [`examples/guardian.conf.example`](examples/guardian.conf.example)
+for a fully-commented starting point.
+
+| Setting          | Default              | What it does |
+|------------------|----------------------|--------------|
+| `DISK_WARN`      | `85`                 | warn when a mount is this % full |
+| `DISK_CRIT`      | `95`                 | critical: reclaim space, and don't restart services until it clears |
+| `MEM_WARN`       | `80`                 | warn at this memory % |
+| `MEM_CRIT`       | `90`                 | critical: drop reclaimable caches |
+| `DISK_MOUNTS`    | `"/ /var"`           | mounts to watch (space-separated) |
+| `MAX_RESTARTS`   | `3`                  | give up on a service after this many restarts... |
+| `RESTART_WINDOW` | `1800`               | ...within this many seconds, then leave it for a human |
+| `HTTP_PROBE_URL` | `http://127.0.0.1/`  | URL the web probe fetches to prove Apache is answering |
+| `HOOK_TIMEOUT`   | `60`                 | seconds before a stuck app hook is killed |
+| `ALERT_CMD`      | `""` (off)           | command to run on can't-self-heal events (see below) |
+
+After editing, `guardian run` (or wait for the next tick) picks it up — no
+restart needed.
+
+### Alerting (optional)
 
 guardian heals what it can, but some things need a human — a service that keeps
 crashing, a disk still full after cleanup, memory pinned. By default it just logs
-those. Set `ALERT_CMD` in `/etc/guardian/guardian.conf` and guardian will run it
-on exactly those can't-self-heal events (throttled, so a stuck box doesn't page
-you every minute). The subject arrives as `$1`, a description on stdin:
+those. Set `ALERT_CMD` and guardian runs it on exactly those can't-self-heal
+events (throttled per kind, so a stuck box doesn't page you every minute). The
+subject arrives as `$1`, the host as `$GUARDIAN_HOST`, a description on stdin:
 
 ```sh
-# /etc/guardian/guardian.conf  — email via mailutils:
+# /etc/guardian/guardian.conf
+# ntfy.sh (no mail server needed — just outbound HTTPS, pushes to your phone):
+ALERT_CMD='curl -fsS -H "Title: guardian: $GUARDIAN_HOST" -d "$(cat)" https://ntfy.sh/your-secret-topic'
+
+# or email — note `mail` needs a working local MTA/relay to actually deliver:
 ALERT_CMD='mail -s "[guardian:$GUARDIAN_HOST] $1" you@example.com'
 ```
 
-See [`examples/guardian.conf.example`](examples/guardian.conf.example) for ntfy
-and Slack one-liners and every other tunable (thresholds, backoff, probe URL).
+See [`examples/guardian.conf.example`](examples/guardian.conf.example) for the
+Slack one-liner and the `ALERT_TIMEOUT` / `ALERT_THROTTLE` knobs.
 
 ## How it decides
 
@@ -140,6 +181,29 @@ GUARDIAN_EVENT      check_failed | service_restarted | disk_critical
 GUARDIAN_REASON     short human reason
 ```
 
+Copy-pasteable starting points for all four live in
+[`examples/hooks/`](examples/hooks/). The shape of a `check` and a `heal`:
+
+```bash
+# <APP_ROOT>/guardian/check — probe only; exit non-zero + print why if unhealthy
+#!/usr/bin/env bash
+curl -fsS --max-time 5 http://127.0.0.1/health.php >/dev/null 2>&1 \
+  || { echo "health endpoint not responding"; exit 1; }
+```
+
+```bash
+# <APP_ROOT>/guardian/heal — repair; runs after check fails or a dep restarted
+#!/usr/bin/env bash
+cd "$GUARDIAN_APP_ROOT" || exit 0
+echo "healing after: $GUARDIAN_EVENT ($GUARDIAN_REASON)"
+rm -rf var/cache/* 2>/dev/null || true          # clear a cache wedged by a DB bounce
+systemctl try-restart myapp-worker 2>/dev/null || true
+```
+
+Keep `check` fast and side-effect-free (it runs every pass); put the actual
+repair in `heal`, and make `heal` idempotent — it may run again next tick if the
+app is still sick.
+
 ### An app turning healing off for itself
 
 Useful during the app's own maintenance — writable by the app (no root needed):
@@ -160,6 +224,43 @@ echo "db unreachable" > /run/guardian/req/myapp
 
 A systemd path unit notices and runs guardian within moments.
 
+## Troubleshooting / FAQ
+
+**Is guardian actually running?**
+
+```bash
+guardian status                       # what it's guarding right now
+systemctl list-timers guardian.timer  # when it last ran / runs next
+guardian logs -f                      # watch it work live
+```
+
+**How is this different from systemd `Restart=always`?**
+`Restart=always` only reacts when a process *exits*. guardian also catches the
+"up but not answering" cases — Apache running but returning errors, MySQL up but
+not accepting connections — and it handles causes systemd can't: it frees a full
+disk, and it refuses to restart-loop a service whose real problem is elsewhere.
+The two compose well: `install.sh --harden` adds `Restart=always` so systemd
+bounces a hard crash in ~5s, while guardian's timer covers everything else. Use
+both.
+
+**guardian keeps restarting a service — why?**
+Its health probe is failing (Apache config test, the HTTP probe, or `mysqladmin
+ping`). Check `guardian logs` for the reason. If the service is down on purpose,
+`guardian off <svc>` (optionally with a duration) tells guardian to leave it
+alone. After `MAX_RESTARTS` in `RESTART_WINDOW` it gives up on its own and logs
+that a human is needed.
+
+**It restarted something I was working on.**
+`guardian off <svc> 2h` pauses guarding for that service (auto-resumes), or
+`guardian off` pauses everything. `guardian on` when you're done.
+
+**Does it email me?** Only if you set `ALERT_CMD` — see
+[Configuration](#configuration). Otherwise everything goes to the journal.
+
+**A note on trust:** app hooks and `ALERT_CMD` run **as root**. Only register
+apps and commands you control — treat `/etc/guardian/apps.d/` like any other
+root-owned config.
+
 ## Tests
 
 ```bash
@@ -174,6 +275,7 @@ install.sh                     idempotent installer / uninstaller
 systemd/                       service, timer, on-demand path unit, tmpfiles
 examples/app.conf.example      a registration file to copy
 examples/guardian.conf.example optional config (thresholds, alerting) to copy
+examples/hooks/                sample check/heal/reclaim/notify hooks to copy
 tests/test.sh                  tests for the pure helpers
 ```
 

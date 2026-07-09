@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# guardian 'reclaim' hook — runs ONLY when a disk is critical. Delete this app's
+# OWN throwaway files: old logs, temp, rebuildable caches. Never delete anything
+# you can't regenerate (uploads, the database, user data). guardian re-checks the
+# disk after all reclaim hooks run.
+set -uo pipefail
+cd "${GUARDIAN_APP_ROOT:-/var/www/myapp}" || exit 0
+
+echo "reclaiming app scratch space"
+find var/log   -type f -name '*.log' -mtime +7 -delete 2>/dev/null || true
+find var/cache -type f               -mtime +1 -delete 2>/dev/null || true
+find var/tmp   -type f               -mtime +1 -delete 2>/dev/null || true
